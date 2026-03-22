@@ -9,7 +9,7 @@ import DxfParser from "dxf-parser";
 interface Pt { x: number; y: number }
 interface Segment { from: Pt; to: Pt; dist: number }
 interface MeasureState { active: boolean; points: Pt[]; segments: Segment[] }
-type SnapType = "endpoint" | "midpoint" | "center" | "quadrant";
+type SnapType = "endpoint" | "midpoint" | "center" | "quadrant" | "nearest";
 interface SnapCandidate { pt: Pt; type: SnapType }
 interface SnapResult    { pt: Pt; type: SnapType }
 
@@ -109,27 +109,140 @@ function collectSnapCandidates(entities: any[], cx: number, cy: number): SnapCan
   return out;
 }
 
-const SNAP_PRIORITY: SnapType[] = ["endpoint", "center", "midpoint", "quadrant"];
+// ═══════════════════════════════════════════════════════════════════════════
+//  NEAREST SNAP — closest point ON geometry (not pre-computed candidates)
+//  Returns the foot of perpendicular from cursor onto each entity.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Closest point on segment [a,b] to p */
+function closestPtOnSegment(p: Pt, a: Pt, b: Pt): Pt {
+  const abx = b.x - a.x, aby = b.y - a.y;
+  const len2 = abx * abx + aby * aby;
+  if (len2 === 0) return { ...a };
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2));
+  return { x: a.x + t * abx, y: a.y + t * aby };
+}
+
+/** Closest point on arc/circle perimeter to p */
+function closestPtOnArc(p: Pt, cx: number, cy: number, r: number, sa?: number, ea?: number): Pt {
+  const angle = Math.atan2(p.y - cy, p.x - cx);
+  if (sa !== undefined && ea !== undefined) {
+    // clamp to arc span
+    let span = ea - sa; if (span < 0) span += Math.PI * 2;
+    let t = angle - sa; if (t < 0) t += Math.PI * 2;
+    const clamped = t <= span ? angle : (t - span / 2 < Math.PI ? ea : sa);
+    return { x: cx + Math.cos(clamped) * r, y: cy + Math.sin(clamped) * r };
+  }
+  return { x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r };
+}
+
+function findNearest(
+  cursor: Pt,
+  entities: any[],
+  cx: number, cy: number,
+  camera: THREE.OrthographicCamera,
+  threshPx = 24,
+): SnapResult | null {
+  const tw = threshPx / camera.zoom;
+  const W = (x: number) => x - cx;
+  const H = (y: number) => y - cy;
+
+  let best: Pt | null = null;
+  let bestDist = Infinity;
+
+  entities.forEach((e) => {
+    // LINE
+    if (e.type === "LINE") {
+      const a = { x: W(e.vertices[0].x), y: H(e.vertices[0].y) };
+      const b = { x: W(e.vertices[1].x), y: H(e.vertices[1].y) };
+      const foot = closestPtOnSegment(cursor, a, b);
+      const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+      if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+    }
+
+    // LWPOLYLINE / POLYLINE
+    if (e.type === "LWPOLYLINE" || e.type === "POLYLINE") {
+      const verts: any[] = e.vertices;
+      for (let i = 0; i < verts.length - 1; i++) {
+        const a = { x: W(verts[i].x), y: H(verts[i].y) };
+        const b = { x: W(verts[i+1].x), y: H(verts[i+1].y) };
+        const foot = closestPtOnSegment(cursor, a, b);
+        const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+        if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+      }
+      if (e.shape && verts.length > 1) {
+        const a = { x: W(verts[verts.length-1].x), y: H(verts[verts.length-1].y) };
+        const b = { x: W(verts[0].x), y: H(verts[0].y) };
+        const foot = closestPtOnSegment(cursor, a, b);
+        const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+        if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+      }
+    }
+
+    // CIRCLE
+    if (e.type === "CIRCLE") {
+      const foot = closestPtOnArc(cursor, W(e.center.x), H(e.center.y), e.radius);
+      const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+      if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+    }
+
+    // ARC
+    if (e.type === "ARC") {
+      const sa = THREE.MathUtils.degToRad(e.startAngle);
+      let ea   = THREE.MathUtils.degToRad(e.endAngle);
+      if (ea < sa) ea += Math.PI * 2;
+      const foot = closestPtOnArc(cursor, W(e.center.x), H(e.center.y), e.radius, sa, ea);
+      const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+      if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+    }
+
+    // SPLINE (approximate with segments)
+    if (e.type === "SPLINE" && e.controlPoints?.length >= 2) {
+      const cp = e.controlPoints.map((p: any) => new THREE.Vector3(W(p.x), H(p.y), 0));
+      const curve = new THREE.CatmullRomCurve3(cp);
+      const pts = curve.getPoints(128);
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = { x: pts[i].x,   y: pts[i].y };
+        const b = { x: pts[i+1].x, y: pts[i+1].y };
+        const foot = closestPtOnSegment(cursor, a, b);
+        const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+        if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+      }
+    }
+  });
+
+  if (!best) return null;
+  return { pt: best, type: "nearest" };
+}
+
+const SNAP_PRIORITY: SnapType[] = ["endpoint", "center", "midpoint", "quadrant", "nearest"];
 
 function findSnap(
   cursor: Pt,
   cands: SnapCandidate[],
+  entities: any[],
+  cx: number, cy: number,
   camera: THREE.OrthographicCamera,
   threshPx = 16,
 ): SnapResult | null {
-  // threshold in world units: px / zoom
   const tw = threshPx / camera.zoom;
+
+  // 1. discrete snaps (endpoint / center / midpoint / quadrant)
   const hits: (SnapCandidate & { dist: number })[] = [];
   cands.forEach((c) => {
     const d = Math.hypot(c.pt.x - cursor.x, c.pt.y - cursor.y);
     if (d <= tw) hits.push({ ...c, dist: d });
   });
-  if (!hits.length) return null;
-  hits.sort((a, b) => {
-    const dp = SNAP_PRIORITY.indexOf(a.type) - SNAP_PRIORITY.indexOf(b.type);
-    return dp !== 0 ? dp : a.dist - b.dist;
-  });
-  return { pt: hits[0].pt, type: hits[0].type };
+  if (hits.length) {
+    hits.sort((a, b) => {
+      const dp = SNAP_PRIORITY.indexOf(a.type) - SNAP_PRIORITY.indexOf(b.type);
+      return dp !== 0 ? dp : a.dist - b.dist;
+    });
+    return { pt: hits[0].pt, type: hits[0].type };
+  }
+
+  // 2. nearest fallback — foot of perpendicular on any geometry
+  return findNearest(cursor, entities, cx, cy, camera, threshPx + 8);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -229,6 +342,13 @@ function drawSnapGlyph(ctx: CanvasRenderingContext2D, sx: number, sy: number, ty
     ctx.beginPath(); ctx.moveTo(sx, sy - 6); ctx.lineTo(sx, sy + 6); ctx.stroke();
   } else if (type === "quadrant") {
     ctx.beginPath(); ctx.moveTo(sx, sy - S); ctx.lineTo(sx + S, sy); ctx.lineTo(sx, sy + S); ctx.lineTo(sx - S, sy); ctx.closePath(); ctx.fill(); ctx.stroke();
+  } else if (type === "nearest") {
+    // AutoCAD nearest: hourglass / X shape
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(sx - S, sy - S); ctx.lineTo(sx + S, sy + S); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx + S, sy - S); ctx.lineTo(sx - S, sy + S); ctx.stroke();
+    // small circle at centre
+    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, Math.PI * 2); ctx.stroke();
   }
   // label
   const lbl = type.charAt(0).toUpperCase() + type.slice(1);
@@ -472,7 +592,7 @@ export default function App() {
 
       let resolved = world;
       if (snapOnRef.current && snapCandsRef.current.length > 0) {
-        const s = findSnap(world, snapCandsRef.current, camera);
+        const s = findSnap(world, snapCandsRef.current, entitiesRef.current, worldRef.cx, worldRef.cy, camera);
         snapRef.current = s;
         if (s) { resolved = s.pt; setSnapLabel(s.type); }
         else setSnapLabel("");
