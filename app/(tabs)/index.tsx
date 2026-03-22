@@ -23,10 +23,10 @@ function buildScene(entities: any[]): THREE.Scene {
   };
 
   entities.forEach((e) => {
-    if (e.vertices)    e.vertices.forEach((v: any) => touch(v.x, v.y));
-    if (e.center)      touch(e.center.x, e.center.y);
-    if (e.position)    touch(e.position.x, e.position.y);
-    if (e.startPoint)  touch(e.startPoint.x, e.startPoint.y);
+    if (e.vertices)   e.vertices.forEach((v: any) => touch(v.x, v.y));
+    if (e.center)     touch(e.center.x, e.center.y);
+    if (e.position)   touch(e.position.x, e.position.y);
+    if (e.startPoint) touch(e.startPoint.x, e.startPoint.y);
   });
 
   const cx    = (minX + maxX) / 2;
@@ -41,12 +41,10 @@ function buildScene(entities: any[]): THREE.Scene {
 
   const toX = (x: number) => x - cx;
   const toY = (y: number) => y - cy;
-
   const black = new THREE.LineBasicMaterial({ color: 0x000000 });
 
   entities.forEach((e) => {
 
-    // LINE
     if (e.type === "LINE") {
       const pts = new Float32Array([
         toX(e.vertices[0].x), toY(e.vertices[0].y), 0,
@@ -57,7 +55,6 @@ function buildScene(entities: any[]): THREE.Scene {
       scene.add(new THREE.Line(geo, black));
     }
 
-    // LWPOLYLINE / POLYLINE
     if (e.type === "LWPOLYLINE" || e.type === "POLYLINE") {
       const pts: number[] = [];
       e.vertices.forEach((v: any) => pts.push(toX(v.x), toY(v.y), 0));
@@ -67,7 +64,6 @@ function buildScene(entities: any[]): THREE.Scene {
       scene.add(new THREE.Line(geo, black));
     }
 
-    // CIRCLE
     if (e.type === "CIRCLE") {
       const curve = new THREE.EllipseCurve(
         toX(e.center.x), toY(e.center.y),
@@ -79,7 +75,6 @@ function buildScene(entities: any[]): THREE.Scene {
       scene.add(new THREE.Line(geo, black));
     }
 
-    // ARC
     if (e.type === "ARC") {
       let startAngle = THREE.MathUtils.degToRad(e.startAngle);
       let endAngle   = THREE.MathUtils.degToRad(e.endAngle);
@@ -94,7 +89,6 @@ function buildScene(entities: any[]): THREE.Scene {
       scene.add(new THREE.Line(geo, black));
     }
 
-    // SPLINE
     if (e.type === "SPLINE" && e.controlPoints?.length >= 2) {
       const cp = e.controlPoints.map(
         (p: any) => new THREE.Vector3(toX(p.x), toY(p.y), 0)
@@ -132,7 +126,6 @@ function drawTexts(
   ctx.fillStyle    = "#000000";
   ctx.textBaseline = "alphabetic";
 
-  // DXF world coords → screen pixels
   const toScreen = (wx: number, wy: number) => ({
     sx:  (wx - cx - camera.position.x) * camera.zoom + w / 2,
     sy: -(wy - cy - camera.position.y) * camera.zoom + h / 2,
@@ -140,16 +133,12 @@ function drawTexts(
 
   entities.forEach((e) => {
 
-    // ── TEXT ────────────────────────────────────────────────────────────
     if (e.type === "TEXT" && e.text) {
       const pos = e.startPoint ?? e.insertionPoint ?? e.position;
       if (!pos) return;
-
       const sizePx = (e.textHeight ?? 2.5) * camera.zoom;
       if (sizePx < 2) return;
-
       const { sx, sy } = toScreen(pos.x, pos.y);
-
       ctx.save();
       ctx.font = `${Math.max(sizePx, 8)}px sans-serif`;
       if (e.rotation) {
@@ -162,26 +151,20 @@ function drawTexts(
       ctx.restore();
     }
 
-    // ── MTEXT ───────────────────────────────────────────────────────────
     if (e.type === "MTEXT" && e.text) {
       const pos = e.position ?? e.insertionPoint;
       if (!pos) return;
-
       const sizePx = (e.height ?? 2.5) * camera.zoom;
       if (sizePx < 2) return;
-
-      // strip AutoCAD inline formatting codes
       const clean = e.text
-        .replace(/\\P/g, "\n")                        // paragraph break → newline
-        .replace(/\\[lLkKoO]/g, "")                   // underline, strikethrough
-        .replace(/\\f[^;]*;/gi, "")                   // font changes  \fArial|...;
-        .replace(/\\[hHwWqQaAbBcCiI][^;]*;/g, "")    // height, width, oblique etc.
+        .replace(/\\P/g, "\n")
+        .replace(/\\[lLkKoO]/g, "")
+        .replace(/\\f[^;]*;/gi, "")
+        .replace(/\\[hHwWqQaAbBcCiI][^;]*;/g, "")
         .replace(/\{|\}/g, "")
         .trim();
-
       const { sx, sy } = toScreen(pos.x, pos.y);
       const lineH = sizePx * 1.2;
-
       ctx.save();
       ctx.font = `${Math.max(sizePx, 8)}px sans-serif`;
       if (e.rotation) {
@@ -201,6 +184,30 @@ function drawTexts(
   });
 }
 
+// ─── screen px → DXF world coords ────────────────────────────────────────
+function screenToDxf(
+  clientX: number,
+  clientY: number,
+  canvas: HTMLCanvasElement,
+  camera: THREE.OrthographicCamera,
+  cx: number,
+  cy: number
+) {
+  const rect = canvas.getBoundingClientRect();
+  const px = clientX - rect.left;
+  const py = clientY - rect.top;
+  const w  = rect.width;
+  const h  = rect.height;
+
+  // inverse of toScreen:
+  //   sx = (wx - cx - camera.position.x) * zoom + w/2
+  //   sy = -(wy - cy - camera.position.y) * zoom + h/2
+  const wx = (px - w / 2) / camera.zoom + camera.position.x + cx;
+  const wy = -(py - h / 2) / camera.zoom + camera.position.y + cy;
+
+  return { x: wx, y: wy };
+}
+
 // ─── fit camera ──────────────────────────────────────────────────────────
 function fitCamera(
   camera: THREE.OrthographicCamera,
@@ -218,7 +225,9 @@ function fitCamera(
 
 // ─── component ───────────────────────────────────────────────────────────
 export default function App() {
-  const [status, setStatus] = useState("No file loaded");
+  const [status, setStatus]   = useState("No file loaded");
+  const [coords, setCoords]   = useState({ x: 0, y: 0 });
+  const [showCoords, setShowCoords] = useState(false);
 
   const entitiesRef   = useRef<any[]>([]);
   const sceneRef      = useRef<THREE.Scene | null>(null);
@@ -237,7 +246,6 @@ export default function App() {
       input.onchange = () => {
         const file = input.files?.[0];
         if (!file) return resolve();
-
         const reader = new FileReader();
 
         reader.onload = () => {
@@ -294,16 +302,8 @@ export default function App() {
       requestAnimationFrame(animate);
       renderer.render(sceneRef.current!, camera);
       gl.endFrameEXP();
-
-      // redraw text overlay in sync with GL frame
       if (textCanvasRef.current && entitiesRef.current.length > 0) {
-        drawTexts(
-          entitiesRef.current,
-          camera,
-          textCanvasRef.current,
-          bboxRef.cx,
-          bboxRef.cy
-        );
+        drawTexts(entitiesRef.current, camera, textCanvasRef.current, bboxRef.cx, bboxRef.cy);
       }
     };
     animate();
@@ -317,17 +317,30 @@ export default function App() {
       camera.updateProjectionMatrix();
     }, { passive: false });
 
-    // pan
+    // pan + coordinate tracking
     let isDragging = false, lastX = 0, lastY = 0;
-    canvas.addEventListener("mousedown", (e) => { isDragging = true; lastX = e.clientX; lastY = e.clientY; });
-    canvas.addEventListener("mousemove", (e) => {
+
+    canvas.addEventListener("mouseenter", () => setShowCoords(true));
+    canvas.addEventListener("mouseleave", () => { setShowCoords(false); isDragging = false; });
+
+    canvas.addEventListener("mousemove", (e: MouseEvent) => {
+      // update DXF coordinates on every mouse move
+      const { x, y } = screenToDxf(e.clientX, e.clientY, canvas, camera, bboxRef.cx, bboxRef.cy);
+      setCoords({ x, y });
+
       if (!isDragging) return;
       camera.position.x -= (e.clientX - lastX) / camera.zoom;
       camera.position.y += (e.clientY - lastY) / camera.zoom;
-      lastX = e.clientX; lastY = e.clientY;
+      lastX = e.clientX;
+      lastY = e.clientY;
     });
-    canvas.addEventListener("mouseup",    () => { isDragging = false; });
-    canvas.addEventListener("mouseleave", () => { isDragging = false; });
+
+    canvas.addEventListener("mousedown", (e: MouseEvent) => {
+      isDragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+    });
+    canvas.addEventListener("mouseup", () => { isDragging = false; });
 
     // pinch zoom
     let lastDist = 0;
@@ -361,6 +374,8 @@ export default function App() {
 
       <View style={styles.gl}>
         <GLView style={StyleSheet.absoluteFill} onContextCreate={onContextCreate} />
+
+        {/* text overlay */}
         <canvas
           ref={textCanvasRef}
           style={{
@@ -371,14 +386,41 @@ export default function App() {
             backgroundColor: "transparent",
           }}
         />
+
+        {/* coordinate display — bottom-left corner */}
+        {showCoords && (
+          <View style={styles.coordBox}>
+            <Text style={styles.coordText}>
+              X: {coords.x.toFixed(3)}
+            </Text>
+            <Text style={styles.coordText}>
+              Y: {coords.y.toFixed(3)}
+            </Text>
+          </View>
+        )}
       </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, paddingTop: 48 },
-  title:     { fontSize: 20, fontWeight: "bold", textAlign: "center" },
-  status:    { fontSize: 12, color: "#666", textAlign: "center", marginVertical: 4 },
-  gl:        { flex: 1 },
+  container:  { flex: 1, paddingTop: 48 },
+  title:      { fontSize: 20, fontWeight: "bold", textAlign: "center" },
+  status:     { fontSize: 12, color: "#666", textAlign: "center", marginVertical: 4 },
+  gl:         { flex: 1 },
+  coordBox:   {
+    position: "absolute",
+    bottom: 12,
+    left: 12,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+    pointerEvents: "none" as any,
+  },
+  coordText:  {
+    color: "#ffffff",
+    fontSize: 12,
+    fontFamily: "monospace",
+  },
 });
