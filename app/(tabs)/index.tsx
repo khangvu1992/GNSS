@@ -9,7 +9,7 @@ import DxfParser from "dxf-parser";
 interface Pt { x: number; y: number }
 interface Segment { from: Pt; to: Pt; dist: number }
 interface MeasureState { active: boolean; points: Pt[]; segments: Segment[] }
-type SnapType = "endpoint" | "midpoint" | "center" | "quadrant" | "nearest";
+type SnapType = "endpoint" | "midpoint" | "center" | "quadrant" | "nearest" | "perpendicular";
 interface SnapCandidate { pt: Pt; type: SnapType }
 interface SnapResult    { pt: Pt; type: SnapType }
 
@@ -215,7 +215,128 @@ function findNearest(
   return { pt: best, type: "nearest" };
 }
 
-const SNAP_PRIORITY: SnapType[] = ["endpoint", "center", "midpoint", "quadrant", "nearest"];
+const SNAP_PRIORITY: SnapType[] = ["endpoint", "center", "midpoint", "quadrant", "perpendicular", "nearest"];
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PERPENDICULAR SNAP
+//  Given a "from" point (last placed measure point), find the point on each
+//  entity where a line from "from" meets the entity at 90°.
+//  • Line/segment: foot of perpendicular from "from" onto the infinite line,
+//    then clamp to segment bounds.
+//  • Circle/Arc:   the point on the perimeter that lies on the line through
+//    center and "from" (two candidates — pick the closer one to cursor).
+//  • Spline: approximate as segments.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Foot of perpendicular from point p onto INFINITE line through a→b */
+function perpFootOnLine(p: Pt, a: Pt, b: Pt): Pt | null {
+  const abx = b.x - a.x, aby = b.y - a.y;
+  const len2 = abx * abx + aby * aby;
+  if (len2 === 0) return null;
+  const t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2;
+  return { x: a.x + t * abx, y: a.y + t * aby };
+}
+
+function findPerpendicular(
+  from: Pt,                          // last placed measure point (WORLD)
+  cursor: Pt,                        // current cursor (WORLD) — for distance check
+  entities: any[],
+  cx: number, cy: number,
+  camera: THREE.OrthographicCamera,
+  threshPx = 20,
+): SnapResult | null {
+  const tw = threshPx / camera.zoom;
+  const W = (x: number) => x - cx;
+  const H = (y: number) => y - cy;
+
+  let best: Pt | null = null;
+  let bestDist = Infinity;
+
+  entities.forEach((e) => {
+
+    // ── LINE ────────────────────────────────────────────────────────────
+    if (e.type === "LINE") {
+      const a = { x: W(e.vertices[0].x), y: H(e.vertices[0].y) };
+      const b = { x: W(e.vertices[1].x), y: H(e.vertices[1].y) };
+      const foot = perpFootOnLine(from, a, b);
+      if (!foot) return;
+      // measure distance from cursor (not from "from") — user moves cursor near the foot
+      const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+      if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+    }
+
+    // ── LWPOLYLINE / POLYLINE ────────────────────────────────────────────
+    if (e.type === "LWPOLYLINE" || e.type === "POLYLINE") {
+      const verts: any[] = e.vertices;
+      const segs = [...verts.map((v: any, i: number) => [verts[i], verts[i+1]]).slice(0, verts.length - 1)];
+      if (e.shape) segs.push([verts[verts.length - 1], verts[0]]);
+      segs.forEach(([v0, v1]) => {
+        const a = { x: W(v0.x), y: H(v0.y) };
+        const b = { x: W(v1.x), y: H(v1.y) };
+        const foot = perpFootOnLine(from, a, b);
+        if (!foot) return;
+        const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+        if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+      });
+    }
+
+    // ── CIRCLE ──────────────────────────────────────────────────────────
+    if (e.type === "CIRCLE") {
+      const ocx = W(e.center.x), ocy = H(e.center.y), r = e.radius;
+      // the perpendicular from "from" to the circle passes through the center
+      // the two candidate points are on the line center→from at distance r
+      const dx = from.x - ocx, dy = from.y - ocy;
+      const len = Math.hypot(dx, dy);
+      if (len === 0) return;
+      const ux = dx / len, uy = dy / len;
+      [1, -1].forEach((sign) => {
+        const pt = { x: ocx + ux * r * sign, y: ocy + uy * r * sign };
+        const d = Math.hypot(pt.x - cursor.x, pt.y - cursor.y);
+        if (d < tw && d < bestDist) { bestDist = d; best = pt; }
+      });
+    }
+
+    // ── ARC ─────────────────────────────────────────────────────────────
+    if (e.type === "ARC") {
+      const ocx = W(e.center.x), ocy = H(e.center.y), r = e.radius;
+      const sa = THREE.MathUtils.degToRad(e.startAngle);
+      let   ea = THREE.MathUtils.degToRad(e.endAngle);
+      if (ea < sa) ea += Math.PI * 2;
+      const span = ea - sa;
+      const dx = from.x - ocx, dy = from.y - ocy;
+      const len = Math.hypot(dx, dy);
+      if (len === 0) return;
+      const ux = dx / len, uy = dy / len;
+      [1, -1].forEach((sign) => {
+        const angle = Math.atan2(uy * sign, ux * sign);
+        // check if this angle is within the arc span
+        let t = angle - sa; if (t < 0) t += Math.PI * 2;
+        if (t > span) return;
+        const pt = { x: ocx + Math.cos(angle) * r, y: ocy + Math.sin(angle) * r };
+        const d = Math.hypot(pt.x - cursor.x, pt.y - cursor.y);
+        if (d < tw && d < bestDist) { bestDist = d; best = pt; }
+      });
+    }
+
+    // ── SPLINE (approximate as segments) ────────────────────────────────
+    if (e.type === "SPLINE" && e.controlPoints?.length >= 2) {
+      const cp = e.controlPoints.map((p: any) => new THREE.Vector3(W(p.x), H(p.y), 0));
+      const curve = new THREE.CatmullRomCurve3(cp);
+      const pts = curve.getPoints(128);
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = { x: pts[i].x,   y: pts[i].y };
+        const b = { x: pts[i+1].x, y: pts[i+1].y };
+        const foot = perpFootOnLine(from, a, b);
+        if (!foot) continue;
+        const d = Math.hypot(foot.x - cursor.x, foot.y - cursor.y);
+        if (d < tw && d < bestDist) { bestDist = d; best = foot; }
+      }
+    }
+  });
+
+  if (!best) return null;
+  return { pt: best, type: "perpendicular" };
+}
 
 function findSnap(
   cursor: Pt,
@@ -224,6 +345,7 @@ function findSnap(
   cx: number, cy: number,
   camera: THREE.OrthographicCamera,
   threshPx = 16,
+  from?: Pt,   // last placed measure point — enables perpendicular snap
 ): SnapResult | null {
   const tw = threshPx / camera.zoom;
 
@@ -241,7 +363,13 @@ function findSnap(
     return { pt: hits[0].pt, type: hits[0].type };
   }
 
-  // 2. nearest fallback — foot of perpendicular on any geometry
+  // 2. perpendicular — only when we have a "from" point (mid-measure)
+  if (from) {
+    const perp = findPerpendicular(from, cursor, entities, cx, cy, camera, threshPx + 8);
+    if (perp) return perp;
+  }
+
+  // 3. nearest fallback
   return findNearest(cursor, entities, cx, cy, camera, threshPx + 8);
 }
 
@@ -343,12 +471,25 @@ function drawSnapGlyph(ctx: CanvasRenderingContext2D, sx: number, sy: number, ty
   } else if (type === "quadrant") {
     ctx.beginPath(); ctx.moveTo(sx, sy - S); ctx.lineTo(sx + S, sy); ctx.lineTo(sx, sy + S); ctx.lineTo(sx - S, sy); ctx.closePath(); ctx.fill(); ctx.stroke();
   } else if (type === "nearest") {
-    // AutoCAD nearest: hourglass / X shape
     ctx.lineWidth = 2.5;
     ctx.beginPath(); ctx.moveTo(sx - S, sy - S); ctx.lineTo(sx + S, sy + S); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(sx + S, sy - S); ctx.lineTo(sx - S, sy + S); ctx.stroke();
-    // small circle at centre
     ctx.beginPath(); ctx.arc(sx, sy, 4, 0, Math.PI * 2); ctx.stroke();
+  } else if (type === "perpendicular") {
+    // AutoCAD perpendicular: right-angle corner symbol ⌐
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(sx - S, sy + S);   // bottom-left
+    ctx.lineTo(sx - S, sy - S);   // top-left (vertical leg)
+    ctx.lineTo(sx + S, sy - S);   // top-right (horizontal leg)
+    ctx.stroke();
+    // small square at the corner to mark 90°
+    const sq = 5;
+    ctx.beginPath();
+    ctx.moveTo(sx - S + sq, sy - S);
+    ctx.lineTo(sx - S + sq, sy - S + sq);
+    ctx.lineTo(sx - S,      sy - S + sq);
+    ctx.stroke();
   }
   // label
   const lbl = type.charAt(0).toUpperCase() + type.slice(1);
@@ -438,10 +579,22 @@ function drawOverlay(
     drawMeasureDot(ctx, sx, sy);
   });
 
-  // ── snap glyph ────────────────────────────────────────────────────────
+  // ── snap glyph + perpendicular indicator ─────────────────────────────
   if (snap) {
     const { sx, sy } = toS(snap.pt.x, snap.pt.y);
     drawSnapGlyph(ctx, sx, sy, snap.type);
+
+    // for perpendicular: draw dashed line from last measure point to snap point
+    if (snap.type === "perpendicular" && measure.points.length > 0) {
+      const last = measure.points[measure.points.length - 1];
+      const a = toS(last.x, last.y);
+      ctx.save();
+      ctx.strokeStyle = "#ffff00";
+      ctx.lineWidth   = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(a.sx, a.sy); ctx.lineTo(sx, sy); ctx.stroke();
+      ctx.restore();
+    }
   }
 }
 
@@ -592,7 +745,11 @@ export default function App() {
 
       let resolved = world;
       if (snapOnRef.current && snapCandsRef.current.length > 0) {
-        const s = findSnap(world, snapCandsRef.current, entitiesRef.current, worldRef.cx, worldRef.cy, camera);
+        const ms = measureRef.current;
+        const from = ms.active && ms.points.length > 0
+          ? ms.points[ms.points.length - 1]
+          : undefined;
+        const s = findSnap(world, snapCandsRef.current, entitiesRef.current, worldRef.cx, worldRef.cy, camera, 16, from);
         snapRef.current = s;
         if (s) { resolved = s.pt; setSnapLabel(s.type); }
         else setSnapLabel("");
