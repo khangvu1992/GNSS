@@ -13,43 +13,39 @@ type SnapType = "endpoint" | "midpoint" | "center" | "quadrant";
 interface SnapCandidate { pt: Pt; type: SnapType }
 interface SnapResult    { pt: Pt; type: SnapType }
 
-// ─── ONE coordinate space: WORLD = raw_DXF − bbox_center ─────────────────
-// Everything — THREE scene, snap candidates, measure points, screen↔world
-// conversion — uses WORLD coords. No cx/cy confusion anywhere.
+// ─── world ref  (WORLD = raw_DXF − bbox_center) ──────────────────────────
 const worldRef = { cx: 0, cy: 0, spanX: 1, spanY: 1 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  COORDINATE HELPERS  (canvas CSS rect, not drawingBuffer pixels)
+//  COORDINATE HELPERS  — everything in WORLD space
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Screen px  →  WORLD coords */
+/** Screen CSS px → WORLD */
 function screenToWorld(
   clientX: number, clientY: number,
   canvas: HTMLCanvasElement,
   camera: THREE.OrthographicCamera,
 ): Pt {
-  const r = canvas.getBoundingClientRect();
-  // normalised device [-1,1]
-  const ndcX =  (clientX - r.left)  / r.width  * 2 - 1;
+  const r    = canvas.getBoundingClientRect();
+  const halfW = (camera.right - camera.left) / 2;
+  const halfH = (camera.top   - camera.bottom) / 2;
+  const ndcX =  (clientX - r.left) / r.width  * 2 - 1;
   const ndcY = -((clientY - r.top)  / r.height * 2 - 1);
-  // orthographic unproject: world = ndc * halfSize / zoom + camPos
-  const halfW = (camera.right  - camera.left)   / 2;   // = drawingBufferWidth/2
-  const halfH = (camera.top    - camera.bottom) / 2;
   return {
     x: ndcX * halfW / camera.zoom + camera.position.x,
     y: ndcY * halfH / camera.zoom + camera.position.y,
   };
 }
 
-/** WORLD coords  →  canvas CSS px */
+/** WORLD → canvas CSS px */
 function worldToScreen(
   wx: number, wy: number,
   canvas: HTMLCanvasElement,
   camera: THREE.OrthographicCamera,
 ): { sx: number; sy: number } {
-  const r = canvas.getBoundingClientRect();
-  const halfW = (camera.right  - camera.left) / 2;
-  const halfH = (camera.top    - camera.bottom) / 2;
+  const r    = canvas.getBoundingClientRect();
+  const halfW = (camera.right - camera.left) / 2;
+  const halfH = (camera.top   - camera.bottom) / 2;
   const ndcX =  (wx - camera.position.x) * camera.zoom / halfW;
   const ndcY =  (wy - camera.position.y) * camera.zoom / halfH;
   return {
@@ -59,12 +55,10 @@ function worldToScreen(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SNAP CANDIDATES  — stored in WORLD coords (raw − center)
+//  SNAP CANDIDATES — stored in WORLD coords
 // ═══════════════════════════════════════════════════════════════════════════
 function collectSnapCandidates(entities: any[], cx: number, cy: number): SnapCandidate[] {
   const out: SnapCandidate[] = [];
-
-  // convert raw DXF → WORLD once here
   const W = (x: number) => x - cx;
   const H = (y: number) => y - cy;
   const add = (rx: number, ry: number, type: SnapType) => {
@@ -78,7 +72,6 @@ function collectSnapCandidates(entities: any[], cx: number, cy: number): SnapCan
       add(v1.x, v1.y, "endpoint");
       add((v0.x + v1.x) / 2, (v0.y + v1.y) / 2, "midpoint");
     }
-
     if (e.type === "LWPOLYLINE" || e.type === "POLYLINE") {
       const verts: any[] = e.vertices;
       verts.forEach((v, i) => {
@@ -87,61 +80,51 @@ function collectSnapCandidates(entities: any[], cx: number, cy: number): SnapCan
         if (next) add((v.x + next.x) / 2, (v.y + next.y) / 2, "midpoint");
       });
     }
-
     if (e.type === "CIRCLE") {
-      const { x, y } = e.center; const r = e.radius;
+      const { x, y } = e.center, r = e.radius;
       add(x, y, "center");
-      add(x + r, y, "quadrant");
-      add(x - r, y, "quadrant");
-      add(x, y + r, "quadrant");
-      add(x, y - r, "quadrant");
+      add(x + r, y, "quadrant"); add(x - r, y, "quadrant");
+      add(x, y + r, "quadrant"); add(x, y - r, "quadrant");
     }
-
     if (e.type === "ARC") {
-      const { x, y } = e.center; const r = e.radius;
+      const { x, y } = e.center, r = e.radius;
       const sa = THREE.MathUtils.degToRad(e.startAngle);
       const ea = THREE.MathUtils.degToRad(e.endAngle);
       add(x, y, "center");
       add(x + Math.cos(sa) * r, y + Math.sin(sa) * r, "endpoint");
       add(x + Math.cos(ea) * r, y + Math.sin(ea) * r, "endpoint");
-      // mid-arc
       let span = ea - sa; if (span < 0) span += Math.PI * 2;
-      const ma = sa + span / 2;
-      add(x + Math.cos(ma) * r, y + Math.sin(ma) * r, "midpoint");
-      // quadrants inside arc
+      add(x + Math.cos(sa + span / 2) * r, y + Math.sin(sa + span / 2) * r, "midpoint");
       [0, Math.PI / 2, Math.PI, Math.PI * 1.5].forEach((qa) => {
         let d = qa - sa; if (d < 0) d += Math.PI * 2;
         if (d <= span) add(x + Math.cos(qa) * r, y + Math.sin(qa) * r, "quadrant");
       });
     }
-
     if (e.type === "SPLINE" && e.controlPoints?.length >= 2) {
       const cp = e.controlPoints;
       add(cp[0].x, cp[0].y, "endpoint");
       add(cp[cp.length - 1].x, cp[cp.length - 1].y, "endpoint");
     }
   });
-
   return out;
 }
 
 const SNAP_PRIORITY: SnapType[] = ["endpoint", "center", "midpoint", "quadrant"];
 
-/** cursor and candidates both in WORLD coords — guaranteed same space */
-function findSnap(cursor: Pt, cands: SnapCandidate[], camera: THREE.OrthographicCamera, threshPx = 16): SnapResult | null {
-  // threshold in world units
-  const halfW = (camera.right - camera.left) / 2;
-  const threshWorld = threshPx * halfW / ((camera.right - camera.left) / 2 * camera.zoom);
-  // simpler: px / zoom gives world units for orthographic
+function findSnap(
+  cursor: Pt,
+  cands: SnapCandidate[],
+  camera: THREE.OrthographicCamera,
+  threshPx = 16,
+): SnapResult | null {
+  // threshold in world units: px / zoom
   const tw = threshPx / camera.zoom;
-
   const hits: (SnapCandidate & { dist: number })[] = [];
   cands.forEach((c) => {
     const d = Math.hypot(c.pt.x - cursor.x, c.pt.y - cursor.y);
     if (d <= tw) hits.push({ ...c, dist: d });
   });
   if (!hits.length) return null;
-
   hits.sort((a, b) => {
     const dp = SNAP_PRIORITY.indexOf(a.type) - SNAP_PRIORITY.indexOf(b.type);
     return dp !== 0 ? dp : a.dist - b.dist;
@@ -150,7 +133,7 @@ function findSnap(cursor: Pt, cands: SnapCandidate[], camera: THREE.Orthographic
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  BUILD THREE SCENE  (WORLD coords)
+//  BUILD SCENE
 // ═══════════════════════════════════════════════════════════════════════════
 function buildScene(entities: any[]): THREE.Scene {
   const scene = new THREE.Scene();
@@ -221,14 +204,14 @@ function buildScene(entities: any[]): THREE.Scene {
   return scene;
 }
 
-function fitCamera(camera: THREE.OrthographicCamera, spanX: number, spanY: number, w: number, h: number) {
-  camera.zoom = (h / 2) / (Math.max(spanX / (w / h), spanY) * 0.6);
-  camera.position.set(0, 0, 10);
-  camera.updateProjectionMatrix();
+function fitCamera(cam: THREE.OrthographicCamera, spanX: number, spanY: number, w: number, h: number) {
+  cam.zoom = (h / 2) / (Math.max(spanX / (w / h), spanY) * 0.6);
+  cam.position.set(0, 0, 10);
+  cam.updateProjectionMatrix();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SNAP GLYPH  (AutoCAD style, yellow)
+//  SNAP GLYPH
 // ═══════════════════════════════════════════════════════════════════════════
 function drawSnapGlyph(ctx: CanvasRenderingContext2D, sx: number, sy: number, type: SnapType) {
   ctx.save();
@@ -236,38 +219,29 @@ function drawSnapGlyph(ctx: CanvasRenderingContext2D, sx: number, sy: number, ty
   ctx.fillStyle   = "rgba(255,255,0,0.15)";
   ctx.lineWidth   = 2;
   const S = 11;
-
   if (type === "endpoint") {
-    ctx.beginPath(); ctx.rect(sx - S, sy - S, S * 2, S * 2);
-    ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.rect(sx - S, sy - S, S * 2, S * 2); ctx.fill(); ctx.stroke();
+  } else if (type === "midpoint") {
+    ctx.beginPath(); ctx.moveTo(sx, sy - S); ctx.lineTo(sx + S, sy + S); ctx.lineTo(sx - S, sy + S); ctx.closePath(); ctx.fill(); ctx.stroke();
+  } else if (type === "center") {
+    ctx.beginPath(); ctx.arc(sx, sy, S, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx - 6, sy); ctx.lineTo(sx + 6, sy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx, sy - 6); ctx.lineTo(sx, sy + 6); ctx.stroke();
+  } else if (type === "quadrant") {
+    ctx.beginPath(); ctx.moveTo(sx, sy - S); ctx.lineTo(sx + S, sy); ctx.lineTo(sx, sy + S); ctx.lineTo(sx - S, sy); ctx.closePath(); ctx.fill(); ctx.stroke();
   }
-  if (type === "midpoint") {
-    ctx.beginPath(); ctx.moveTo(sx, sy - S); ctx.lineTo(sx + S, sy + S); ctx.lineTo(sx - S, sy + S); ctx.closePath();
-    ctx.fill(); ctx.stroke();
-  }
-  if (type === "center") {
-    ctx.beginPath(); ctx.arc(sx, sy, S, 0, Math.PI * 2);
-    ctx.fill(); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(sx - S * 0.55, sy); ctx.lineTo(sx + S * 0.55, sy); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(sx, sy - S * 0.55); ctx.lineTo(sx, sy + S * 0.55); ctx.stroke();
-  }
-  if (type === "quadrant") {
-    ctx.beginPath(); ctx.moveTo(sx, sy - S); ctx.lineTo(sx + S, sy); ctx.lineTo(sx, sy + S); ctx.lineTo(sx - S, sy); ctx.closePath();
-    ctx.fill(); ctx.stroke();
-  }
-
   // label
-  const label = type.charAt(0).toUpperCase() + type.slice(1);
+  const lbl = type.charAt(0).toUpperCase() + type.slice(1);
   ctx.font = "bold 11px sans-serif";
   ctx.textAlign = "center"; ctx.textBaseline = "bottom";
   ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0,0,0,0.85)";
-  ctx.strokeText(label, sx, sy - S - 3);
-  ctx.fillStyle = "#ffff00"; ctx.fillText(label, sx, sy - S - 3);
+  ctx.strokeText(lbl, sx, sy - S - 3);
+  ctx.fillStyle = "#ffff00"; ctx.fillText(lbl, sx, sy - S - 3);
   ctx.restore();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  OVERLAY  — all coords converted via worldToScreen
+//  OVERLAY
 // ═══════════════════════════════════════════════════════════════════════════
 function drawOverlay(
   entities: any[],
@@ -275,16 +249,18 @@ function drawOverlay(
   canvas: HTMLCanvasElement,
   measure: MeasureState,
   snap: SnapResult | null,
-  cursor: Pt | null,       // WORLD coords
+  cursor: Pt | null,
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  // match CSS size (not drawingBuffer) — worldToScreen uses getBoundingClientRect too
-  canvas.width  = canvas.offsetWidth;
-  canvas.height = canvas.offsetHeight;
-  const w = canvas.width, h = canvas.height;
-  if (!w || !h) return;
-  ctx.clearRect(0, 0, w, h);
+
+  // sync canvas pixel size to CSS size
+  const cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+  if (!cw || !ch) return;
+  if (canvas.width !== cw)  canvas.width  = cw;
+  if (canvas.height !== ch) canvas.height = ch;
+
+  ctx.clearRect(0, 0, cw, ch);
 
   const toS = (wx: number, wy: number) => worldToScreen(wx, wy, canvas, camera);
 
@@ -355,14 +331,16 @@ function drawMeasureLine(ctx: CanvasRenderingContext2D, x1: number, y1: number, 
   ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
   const perp = Math.atan2(y2 - y1, x2 - x1) + Math.PI / 2;
   [{ x: x1, y: y1 }, { x: x2, y: y2 }].forEach(({ x, y }) => {
-    ctx.beginPath(); ctx.moveTo(x + Math.cos(perp) * 7, y + Math.sin(perp) * 7);
-    ctx.lineTo(x - Math.cos(perp) * 7, y - Math.sin(perp) * 7); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + Math.cos(perp) * 7, y + Math.sin(perp) * 7);
+    ctx.lineTo(x - Math.cos(perp) * 7, y - Math.sin(perp) * 7);
+    ctx.stroke();
   });
   const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
   const label = dist < 1 ? `${(dist * 1000).toFixed(1)} mm` : `${dist.toFixed(3)} m`;
   ctx.font = "bold 12px monospace";
   const tw = ctx.measureText(label).width;
-  ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.fillRect(mx - tw / 2 - 4, my - 16, tw + 8, 18);
+  ctx.fillStyle = "rgba(255,255,255,0.92)"; ctx.fillRect(mx - tw / 2 - 4, my - 16, tw + 8, 18);
   ctx.fillStyle = "#e63c00"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
   ctx.fillText(label, mx, my - 7);
   ctx.restore();
@@ -393,12 +371,15 @@ export default function App() {
   const glRef        = useRef<any>(null);
   const overlayRef   = useRef<HTMLCanvasElement | null>(null);
 
-  // live refs — no re-render on every frame
   const measureRef   = useRef<MeasureState>({ active: false, points: [], segments: [] });
   const snapRef      = useRef<SnapResult | null>(null);
-  const cursorRef    = useRef<Pt | null>(null);   // WORLD coords
+  const cursorRef    = useRef<Pt | null>(null);  // WORLD, snapped if snap active
   const measuringRef = useRef(false);
   const snapOnRef    = useRef(true);
+
+  // track pending dblclick — suppress the 2nd click of a double-click
+  const clickTimerRef    = useRef<any>(null);
+  const pendingClickRef  = useRef<Pt | null>(null);
 
   useEffect(() => { measuringRef.current = measuring; }, [measuring]);
   useEffect(() => { snapOnRef.current    = snapOn;    }, [snapOn]);
@@ -416,10 +397,8 @@ export default function App() {
           const dxf = new DxfParser().parseSync(reader.result as string);
           if (!dxf || !dxf.entities) { setStatus("Failed to parse DXF"); return resolve(); }
           setStatus(`Loaded ${dxf.entities.length} entities`);
-          entitiesRef.current = dxf.entities;
-          // build scene first so worldRef.cx/cy is set
-          sceneRef.current    = buildScene(dxf.entities);
-          // snap candidates in WORLD coords (using the just-computed cx/cy)
+          entitiesRef.current  = dxf.entities;
+          sceneRef.current     = buildScene(dxf.entities);  // sets worldRef.cx/cy
           snapCandsRef.current = collectSnapCandidates(dxf.entities, worldRef.cx, worldRef.cy);
           if (cameraRef.current && glRef.current) {
             const { drawingBufferWidth: ww, drawingBufferHeight: hh } = glRef.current;
@@ -440,6 +419,7 @@ export default function App() {
     setMeasuring(next);
     if (!next) { setTotalDist(null); snapRef.current = null; }
   };
+
   const clearMeasure = () => {
     measureRef.current = { active: true, points: [], segments: [] };
     setTotalDist(null);
@@ -454,7 +434,6 @@ export default function App() {
     renderer.setSize(w, h); renderer.setClearColor(0xffffff, 1);
     rendererRef.current = renderer;
 
-    // camera frustum in world units
     const camera = new THREE.OrthographicCamera(-w / 2, w / 2, h / 2, -h / 2, 1, 1000);
     camera.position.z = 10; cameraRef.current = camera;
 
@@ -472,7 +451,7 @@ export default function App() {
 
     const canvas = gl.canvas as HTMLCanvasElement;
 
-    // zoom
+    // ── zoom ──────────────────────────────────────────────────────────
     canvas.addEventListener("wheel", (e: WheelEvent) => {
       e.preventDefault();
       camera.zoom *= e.deltaY > 0 ? 0.9 : 1.1;
@@ -481,18 +460,18 @@ export default function App() {
 
     canvas.addEventListener("mouseenter", () => setShowCoords(true));
     canvas.addEventListener("mouseleave", () => {
-      setShowCoords(false); snapRef.current = null; cursorRef.current = null; setSnapLabel("");
+      setShowCoords(false);
+      snapRef.current = null; cursorRef.current = null; setSnapLabel("");
     });
 
-    let isDragging = false, lastX = 0, lastY = 0;
+    let isDragging = false, lastX = 0, lastY = 0, didDrag = false;
 
+    // ── mouse move: snap + coord update + pan ─────────────────────────
     canvas.addEventListener("mousemove", (e: MouseEvent) => {
-      // cursor in WORLD coords
       const world = screenToWorld(e.clientX, e.clientY, canvas, camera);
 
       let resolved = world;
       if (snapOnRef.current && snapCandsRef.current.length > 0) {
-        // both cursor and candidates in WORLD coords — guaranteed match ✓
         const s = findSnap(world, snapCandsRef.current, camera);
         snapRef.current = s;
         if (s) { resolved = s.pt; setSnapLabel(s.type); }
@@ -501,67 +480,90 @@ export default function App() {
         snapRef.current = null; setSnapLabel("");
       }
 
-      cursorRef.current = resolved;
-      // display in raw DXF coords (add back center) so user sees real coordinates
+      // always update cursor with the snapped point
+      cursorRef.current = { ...resolved };
+
+      // display raw DXF coords to user
       setCoords({ x: resolved.x + worldRef.cx, y: resolved.y + worldRef.cy });
 
       if (isDragging && !measuringRef.current) {
+        didDrag = true;
         camera.position.x -= (e.clientX - lastX) / camera.zoom;
         camera.position.y += (e.clientY - lastY) / camera.zoom;
       }
       lastX = e.clientX; lastY = e.clientY;
     });
 
+    // ── mouse down ────────────────────────────────────────────────────
     canvas.addEventListener("mousedown", (e: MouseEvent) => {
-      if (measuringRef.current) {
-        const pt = cursorRef.current ?? screenToWorld(e.clientX, e.clientY, canvas, camera);
+      if (e.button !== 0) return;
+      isDragging = true; didDrag = false;
+      lastX = e.clientX; lastY = e.clientY;
+    });
+
+    // ── mouse up — distinguish click vs drag ──────────────────────────
+    canvas.addEventListener("mouseup", (e: MouseEvent) => {
+      isDragging = false;
+      if (e.button !== 0) return;
+      if (didDrag || !measuringRef.current) return;
+
+      // capture the snapped point at the moment of click
+      const pt = cursorRef.current
+        ? { ...cursorRef.current }
+        : screenToWorld(e.clientX, e.clientY, canvas, camera);
+
+      // delay adding the point — if dblclick fires we cancel it
+      if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
+      pendingClickRef.current = pt;
+      clickTimerRef.current = setTimeout(() => {
+        // single click confirmed — add the point
         const ms = measureRef.current;
+        if (!ms.active) return;
+        const p = pendingClickRef.current!;
         if (ms.points.length > 0) {
           const last = ms.points[ms.points.length - 1];
-          const dist = Math.hypot(pt.x - last.x, pt.y - last.y);
-          ms.segments.push({ from: { ...last }, to: { ...pt }, dist });
-          setTotalDist(ms.segments.reduce((s, seg) => s + seg.dist, 0));
+          const dist = Math.hypot(p.x - last.x, p.y - last.y);
+          if (dist > 0) {
+            ms.segments.push({ from: { ...last }, to: { ...p }, dist });
+            setTotalDist(ms.segments.reduce((s, seg) => s + seg.dist, 0));
+          }
         }
-        ms.points.push({ ...pt });
-      } else {
-        isDragging = true; lastX = e.clientX; lastY = e.clientY;
-      }
+        ms.points.push({ ...p });
+        pendingClickRef.current = null;
+      }, 220); // 220ms window to catch dblclick
     });
 
-    canvas.addEventListener("mouseup", () => { isDragging = false; });
-
-    // double-click: finish chain (remove phantom point added by 2nd click)
+    // ── double click — finish chain ───────────────────────────────────
     canvas.addEventListener("dblclick", () => {
-      if (measuringRef.current) {
-        const ms = measureRef.current;
-        if (ms.points.length > 0) ms.points.pop();
-        if (ms.segments.length > 0) ms.segments.pop();
-        setTotalDist(ms.segments.length > 0 ? ms.segments.reduce((s, seg) => s + seg.dist, 0) : null);
-      }
+      if (!measuringRef.current) return;
+      // cancel the pending single click
+      if (clickTimerRef.current) { clearTimeout(clickTimerRef.current); clickTimerRef.current = null; }
+      pendingClickRef.current = null;
+      // end the chain — nothing extra added
+      setTotalDist((t) => t);  // force re-render with current total
     });
 
-    // right-click: undo last point
+    // ── right click — undo last segment ──────────────────────────────
     canvas.addEventListener("contextmenu", (e: MouseEvent) => {
       e.preventDefault();
-      if (measuringRef.current) {
-        const ms = measureRef.current;
-        if (ms.points.length > 0) ms.points.pop();
-        if (ms.segments.length > 0) ms.segments.pop();
-        setTotalDist(ms.segments.length > 0 ? ms.segments.reduce((s, seg) => s + seg.dist, 0) : null);
-      }
+      if (!measuringRef.current) return;
+      const ms = measureRef.current;
+      if (ms.points.length > 0) ms.points.pop();
+      if (ms.segments.length > 0) ms.segments.pop();
+      setTotalDist(ms.segments.length > 0 ? ms.segments.reduce((s, seg) => s + seg.dist, 0) : null);
     });
 
-    // pinch zoom
-    let lastDist = 0;
+    // ── pinch zoom ────────────────────────────────────────────────────
+    let lastTDist = 0;
     canvas.addEventListener("touchstart", (e) => {
       if (e.touches.length === 2)
-        lastDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+        lastTDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
     });
     canvas.addEventListener("touchmove", (e) => {
       e.preventDefault();
       if (e.touches.length === 2) {
         const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
-        camera.zoom *= d / lastDist; camera.updateProjectionMatrix(); lastDist = d;
+        camera.zoom *= d / lastTDist; camera.updateProjectionMatrix(); lastTDist = d;
       }
     }, { passive: false });
 
@@ -591,13 +593,17 @@ export default function App() {
         </>}
       </View>
 
-      {measuring && <Text style={styles.hint}>Click · Double-click to finish · Right-click to undo</Text>}
+      {measuring && <Text style={styles.hint}>Click to place · Double-click to finish · Right-click to undo</Text>}
 
       <View style={styles.gl}>
         <GLView style={StyleSheet.absoluteFill} onContextCreate={onContextCreate} />
         <canvas
           ref={overlayRef}
-          style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", backgroundColor: "transparent" } as any}
+          style={{
+            position: "absolute", top: 0, left: 0,
+            width: "100%", height: "100%",
+            pointerEvents: "none", backgroundColor: "transparent",
+          } as any}
         />
 
         {showCoords && (
